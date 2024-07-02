@@ -1,27 +1,3 @@
-/*
-  This code is free software; you can redistribute it and/or
-  modify it under the terms of the GNU Lesser General Public
-  License as published by the Free Software Foundation; either
-  version 2.1 of the License, or (at your option) any later version.
-  This code is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-  Lesser General Public License for more details.
-  You should have received a copy of the GNU Lesser General Public
-  License along with this library; if not, write to the Free Software
-  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
-*/
-
-// This Sketch is based on code by  Timo Lappalainen https://github.com/ttlappalainen
-//                                  Andreas Koritnik https://github.com/AK-Homberger
-//                                  Cory J. Fowler   https://github.com/coryjfowler
-//                                    
-//                                  
-//                                      
-// 20211214 first version to read Volvo Penta MDI J1939 messages (RPM, engine hours, coolant temperature, alternator voltage)
-// from VP CANBus, convert it and write it to a N2K bus.
-//
-
 #define ESP32_CAN_TX_PIN GPIO_NUM_26  // Set CAN TX port to 26  
 #define ESP32_CAN_RX_PIN GPIO_NUM_27  // Set CAN RX port to 27
 
@@ -34,6 +10,7 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
 
 // to be printed with some additional information to USB-serial
 const char Description[] = "Description: Volvo Penta->N2K interface. Read J1939 data from VP canbus, \nconvert it and send it to a N2K bus.\n\n";
@@ -145,72 +122,96 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   // Configure server routes
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    String html = "<html><body><h1>A'Marie's Volvo Penta N2K Interface Data</h1>";
-    html += "<p>RPM: " + String(RPM) + "</p>";
-    html += "<p>Engine Hours: " + String(EngineHours) + "</p>";
-    html += "<p>Coolant Temperature: " + String(CoolantTemperature) + "</p>";
-    html += "<p>Alternator Voltage: " + String(AlternatorVoltage) + "</p>";
-    html += "</body></html>";
-    request->send(200, "text/html", html);
-  });
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+        String html = "<html><head><title>Volvo Penta N2K Interface</title></head><body>";
+        html += "<h1>A'Marie's Volvo Penta N2K Interface Data</h1>";
+        html += "<p>RPM: <span id='rpm'>Loading...</span></p>";
+        html += "<p>Engine Hours: <span id='engineHours'>Loading...</span></p>";
+        html += "<p>Coolant Temperature: <span id='coolantTemp'>Loading...</span></p>";
+        html += "<p>Alternator Voltage: <span id='altVoltage'>Loading...</span></p>";
+        html += "<script>";
+        html += "function fetchData() {";
+        html += "fetch('/data').then(response => response.json()).then(data => {";
+        html += "document.getElementById('rpm').textContent = data.RPM;";
+        html += "document.getElementById('engineHours').textContent = data.EngineHours;";
+        html += "document.getElementById('coolantTemp').textContent = data.CoolantTemperature;";
+        html += "document.getElementById('altVoltage').textContent = data.AlternatorVoltage;";
+        html += "});";
+        html += "}";
+        html += "setInterval(fetchData, 1000);";  // Fetch data every second
+        html += "window.onload = fetchData;";  // Fetch data on load
+        html += "</script>";
+        html += "</body></html>";
+        request->send(200, "text/html", html);
+    });
+
+    // JSON route
+    server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request){
+        String json;
+        JsonDocument doc;
+        doc["RPM"] = RPM;
+        doc["EngineHours"] = EngineHours;
+        doc["CoolantTemperature"] = CoolantTemperature;
+        doc["AlternatorVoltage"] = AlternatorVoltage;
+        serializeJson(doc, json);
+        request->send(200, "application/json", json);
+    });
 
   // Start server
   server.begin();
 }
 
 //*****************************************************************************
-void loop() 
-{
+void loop() {
   long unsigned int PGN;
   unsigned char len = 0;
   unsigned char Data[16];
   tN2kMsg N2kMsg;
   static int SendSTAT;
-  
+
   NMEA2000.ParseMessages();  // to be removed?
 
   CheckSourceAddressChange();
 
-  if ( Serial.available())      // Dummy to empty input buffer to avoid board to stuck with e.g. NMEA Reader
+  if (Serial.available())      // Dummy to empty input buffer to avoid board to stuck with e.g. NMEA Reader
     Serial.read();
 
-  if(!digitalRead(CAN0_INT))                  // If CAN0_INT pin is low, read receive buffer
-  {
+  if (!digitalRead(CAN0_INT)) {                  // If CAN0_INT pin is low, read receive buffer
     CAN0.readMsgBuf(&PGN, &len, Data);      // Read data: len = data length, buf = data byte(s)
 
-    PGN = (PGN>>8)&0xFFFF;                // get the PGN
+    PGN = (PGN >> 8) & 0xFFFF;                // get the PGN
 
-    switch(PGN)
-    {
-      case 61444: N2kMsg = PGN;
-                  RPM = (Data[4] * 256.0 + Data[3] ) / 8.0;                                           // get revolutions
-                  SetN2kPGN127488(N2kMsg, 0, (double) RPM, (double) N2kDoubleNA, (int8_t) N2kInt8NA); // prepare the datagramm
-                  NMEA2000.SendMsg(N2kMsg);                                                           // send it out
-                  Serial.printf("RPM: %.1f\n", RPM);
-                  break;
-      case 65253: EngineHours = (Data[0] + Data[1] * 256)/20;             // get engine hours
-                  SendSTAT |= 1;                                          // set status 'engine hours value is available'
-                  break;
-      case 65262: CoolantTemperature = Data[0] - 40;                      // get coolant temperature
-                  SendSTAT |= 2;                                          // set status 'coolant temperature value is available'
-                  break;
-      case 65271: AlternatorVoltage = (Data[7] * 256.0 + Data[6]) / 20.0; // get alternator voltage
-                  SendSTAT |= 4;                                          // set status 'alternator voltage value is available'
-                  break;
+    switch (PGN) {
+      case 61444:
+        RPM = (Data[4] * 256.0 + Data[3]) / 8.0;                                           // get revolutions
+        SetN2kPGN127488(N2kMsg, 0, (double)RPM, (double)N2kDoubleNA, (int8_t)N2kInt8NA); // prepare the datagram
+        NMEA2000.SendMsg(N2kMsg);                                                           // send it out
+        Serial.printf("RPM: %.1f\n", RPM);
+        break;
+      case 65253:
+        EngineHours = (Data[0] + Data[1] * 256) / 20;             // get engine hours
+        SendSTAT |= 1;                                          // set status 'engine hours value is available'
+        break;
+      case 65262:
+        CoolantTemperature = Data[0] - 40;                      // get coolant temperature
+        SendSTAT |= 2;                                          // set status 'coolant temperature value is available'
+        break;
+      case 65271:
+        AlternatorVoltage = (Data[7] * 256.0 + Data[6]) / 20.0; // get alternator voltage
+        SendSTAT |= 4;                                          // set status 'alternator voltage value is available'
+        break;
     }
 
-    if ( SendSTAT == 0x07 )   // are the three values available
-    {
+    if (SendSTAT == 0x07) {   // are the three values available
       N2kMsg = PGN;
-      SetN2kPGN127489 (N2kMsg, 0, N2kDoubleNA, N2kDoubleNA, CToKelvin(CoolantTemperature), AlternatorVoltage, N2kDoubleNA, EngineHours*3600.0, N2kDoubleNA, N2kDoubleNA, N2kInt8NA, N2kInt8NA, 0x00,0x00);
+      SetN2kPGN127489(N2kMsg, 0, N2kDoubleNA, N2kDoubleNA, CToKelvin(CoolantTemperature), AlternatorVoltage, N2kDoubleNA, EngineHours * 3600.0, N2kDoubleNA, N2kDoubleNA, N2kInt8NA, N2kInt8NA, 0x00, 0x00);
       NMEA2000.SendMsg(N2kMsg);
       Serial.printf("Battery:%.2f Hours: %.2f Temperature: %.2f\n", AlternatorVoltage, EngineHours, CoolantTemperature);
       CoolantTemperature = AlternatorVoltage = EngineHours = 0.0;
       SendSTAT = 0;
     }
   }
-} 
+}
 
 //*****************************************************************************
 // Function to check if SourceAddress has changed (due to address conflict on bus)
